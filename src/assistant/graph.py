@@ -1,39 +1,57 @@
 import json
-
+# from pydantic import BaseModel
 from typing_extensions import Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
-from langchain_ollama import ChatOllama
+#  from langchain_ollama import ChatOllama
+from langchain_groq import ChatGroq
 from langgraph.graph import START, END, StateGraph
 
-from assistant.configuration import Configuration, SearchAPI
+from assistant.configuration import Configuration
+#  SearchAPI
 from assistant.utils import deduplicate_and_format_sources, tavily_search, format_sources, perplexity_search
 from assistant.state import SummaryState, SummaryStateInput, SummaryStateOutput
 from assistant.prompts import query_writer_instructions, summarizer_instructions, reflection_instructions
 
-# Nodes   
+
+# Nodes
 def generate_query(state: SummaryState, config: RunnableConfig):
-    """ Generate a query for web search """
-    
-    # Format the prompt
+    """ Generate a query for web search without using `format="json"` """
+
+    # Format the instructions for the LLM
     query_writer_instructions_formatted = query_writer_instructions.format(research_topic=state.research_topic)
 
-    # Generate a query
+    # Initialize ChatGroq **without** `format="json"`
     configurable = Configuration.from_runnable_config(config)
-    llm_json_mode = ChatOllama(model=configurable.local_llm, temperature=0, format="json")
-    result = llm_json_mode.invoke(
-        [SystemMessage(content=query_writer_instructions_formatted),
-        HumanMessage(content=f"Generate a query for web search:")]
-    )   
-    query = json.loads(result.content)
-    
-    return {"search_query": query['query']}
+    llm = ChatGroq(model=configurable.llm_query, temperature=0)  # ❌ Removed format="json"
+
+    # Correct the prompt structure
+    messages = [
+        SystemMessage(content="You are a helpful assistant that generates web search queries."),
+        HumanMessage(content=query_writer_instructions_formatted),
+        HumanMessage(content="Generate a concise search query related to the research topic and return it in JSON format. "
+                             "Ensure the response is structured as follows:\n\n"
+                             "{\n"
+                             '  "query": "<your_generated_query>"\n'
+                             "}")
+    ]
+
+    # Invoke the model
+    result = llm.invoke(messages)
+
+    try:
+        # Parse the response as JSON manually
+        query_data = json.loads(result.content.strip())  # Strip potential whitespace before parsing
+        return {"search_query": query_data["query"]}
+    except json.JSONDecodeError:
+        return {"error": "Failed to parse JSON. Response: " + result.content}
+
 
 def web_research(state: SummaryState, config: RunnableConfig):
     """ Gather information from the web """
-    
-    # Configure 
+
+    # Configure
     configurable = Configuration.from_runnable_config(config)
 
     # Handle both cases for search_api:
@@ -53,12 +71,13 @@ def web_research(state: SummaryState, config: RunnableConfig):
         search_str = deduplicate_and_format_sources(search_results, max_tokens_per_source=1000, include_raw_content=False)
     else:
         raise ValueError(f"Unsupported search API: {configurable.search_api}")
-        
+
     return {"sources_gathered": [format_sources(search_results)], "research_loop_count": state.research_loop_count + 1, "web_research_results": [search_str]}
+
 
 def summarize_sources(state: SummaryState, config: RunnableConfig):
     """ Summarize the gathered sources """
-    
+
     # Existing summary
     existing_summary = state.running_summary
 
@@ -80,16 +99,15 @@ def summarize_sources(state: SummaryState, config: RunnableConfig):
 
     # Run the LLM
     configurable = Configuration.from_runnable_config(config)
-    llm = ChatOllama(model=configurable.local_llm, temperature=0)
+    llm = ChatGroq(model=configurable.llm_summarize, temperature=0)
     result = llm.invoke(
-        [SystemMessage(content=summarizer_instructions),
-        HumanMessage(content=human_message_content)]
+        [SystemMessage(content=summarizer_instructions), HumanMessage(content=human_message_content)]
     )
 
     running_summary = result.content
 
-    # TODO: This is a hack to remove the <think> tags w/ Deepseek models 
-    # It appears very challenging to prompt them out of the responses 
+    # TODO: This is a hack to remove the <think> tags w/ Deepseek models
+    # It appears very challenging to prompt them out of the responses
     while "<think>" in running_summary and "</think>" in running_summary:
         start = running_summary.find("<think>")
         end = running_summary.find("</think>") + len("</think>")
@@ -97,37 +115,58 @@ def summarize_sources(state: SummaryState, config: RunnableConfig):
 
     return {"running_summary": running_summary}
 
+
 def reflect_on_summary(state: SummaryState, config: RunnableConfig):
-    """ Reflect on the summary and generate a follow-up query """
+    """ Reflect on the summary and generate a follow-up query without using `format="json"` """
 
-    # Generate a query
+    # Initialize ChatGroq **without** `format="json"`
     configurable = Configuration.from_runnable_config(config)
-    llm_json_mode = ChatOllama(model=configurable.local_llm, temperature=0, format="json")
-    result = llm_json_mode.invoke(
-        [SystemMessage(content=reflection_instructions.format(research_topic=state.research_topic)),
-        HumanMessage(content=f"Identify a knowledge gap and generate a follow-up web search query based on our existing knowledge: {state.running_summary}")]
-    )   
-    follow_up_query = json.loads(result.content)
+    llm = ChatGroq(model=configurable.llm_refect, temperature=0)
 
-    # Get the follow-up query
-    query = follow_up_query.get('follow_up_query')
+    # Format the reflection prompt
+    reflection_prompt = (
+        "Identify a knowledge gap based on the existing research summary and generate a follow-up web search query. "
+        "Return the result strictly in JSON format with the following structure:\n\n"
+        "{\n"
+        '  "follow_up_query": "<your_generated_follow_up_query>"\n'
+        "}\n\n"
+        "Existing Summary:\n" + state.running_summary
+    )
 
-    # JSON mode can fail in some cases
-    if not query:
+    # Construct messages for the model
+    messages = [
+        SystemMessage(content="You are an AI assistant helping with research by identifying knowledge gaps."),
+        HumanMessage(content=reflection_instructions.format(research_topic=state.research_topic)),
+        HumanMessage(content=reflection_prompt)
+    ]
 
-        # Fallback to a placeholder query
+    # Invoke the model
+    result = llm.invoke(messages)
+
+    try:
+        # Manually parse JSON
+        follow_up_data = json.loads(result.content.strip())  # Strip extra whitespace
+        follow_up_query = follow_up_data.get("follow_up_query", "").strip()
+
+        # If query is empty, provide a fallback
+        if not follow_up_query:
+            follow_up_query = f"Tell me more about {state.research_topic}"
+
+        return {"search_query": follow_up_query}
+
+    except json.JSONDecodeError:
+        # If JSON parsing fails, return a fallback query
         return {"search_query": f"Tell me more about {state.research_topic}"}
 
-    # Update search query with follow-up query
-    return {"search_query": follow_up_query['follow_up_query']}
 
 def finalize_summary(state: SummaryState):
     """ Finalize the summary """
-    
+
     # Format all accumulated sources into a single bulleted list
     all_sources = "\n".join(source for source in state.sources_gathered)
     state.running_summary = f"## Summary\n\n{state.running_summary}\n\n ### Sources:\n{all_sources}"
     return {"running_summary": state.running_summary}
+
 
 def route_research(state: SummaryState, config: RunnableConfig) -> Literal["finalize_summary", "web_research"]:
     """ Route the research based on the follow-up query """
@@ -136,9 +175,10 @@ def route_research(state: SummaryState, config: RunnableConfig) -> Literal["fina
     if state.research_loop_count <= configurable.max_web_research_loops:
         return "web_research"
     else:
-        return "finalize_summary" 
-    
-# Add nodes and edges 
+        return "finalize_summary"
+
+
+# Add nodes and edges
 builder = StateGraph(SummaryState, input=SummaryStateInput, output=SummaryStateOutput, config_schema=Configuration)
 builder.add_node("generate_query", generate_query)
 builder.add_node("web_research", web_research)

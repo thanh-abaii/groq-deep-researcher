@@ -1,0 +1,30 @@
+# Bỏ qua file cấu hình môi trường
+.env
+
+# Bỏ qua thư mục của môi trường ảo (ví dụ như venv, .venv)
+venv/
+.venv/
+
+# Bỏ qua các file cache của Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Bỏ qua các file log
+*.log
+
+# Bỏ qua thư mục cache của hệ thống
+cache/
+.cache/
+
+# Bỏ qua dữ liệu được tạo tự động
+.DS_Store
+Thumbs.db
+
+# Nếu dùng Jupyter Notebook, có thể bỏ qua checkpoint
+.ipynb_checkpoints/
+
+# Nếu dùng các IDE như VSCode hoặc PyCharm, bỏ qua thư mục cấu hình IDE
+.vscode/
+.idea/
